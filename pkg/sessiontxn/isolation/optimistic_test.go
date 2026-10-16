@@ -334,3 +334,31 @@ func initializeOptimisticProvider(t testing.TB, tk *testkit.TestKit, withExplici
 	require.NoError(t, err)
 	return assert.CheckAndGetProvider(t)
 }
+
+func TestOptimisticProviderUniqueKeyPointGetReadTS(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	defer tk.MustExec("rollback")
+	tk.MustExec("use test")
+	tk.MustExec("create table t(id int primary key, uk int, v int, unique key uk_idx(uk))")
+
+	readTSFor := func(sql string) uint64 {
+		stmts, _, err := parser.New().Parse(sql, "", "")
+		require.NoError(t, err)
+		provider := initializeOptimisticProvider(t, tk, false)
+		require.NoError(t, provider.OnStmtStart(context.TODO(), stmts[0]))
+		plan, _, err := planner.Optimize(context.TODO(), tk.Session(), resolve.NewNodeW(stmts[0]), provider.GetTxnInfoSchema())
+		require.NoError(t, err)
+		require.NoError(t, provider.AdviseOptimizeWithPlan(plan))
+		readTS, err := provider.GetStmtReadTS()
+		require.NoError(t, err)
+		return readTS
+	}
+
+	tk.MustExec("set @@tidb_enable_unique_key_point_get_max_ts = OFF")
+	require.Less(t, readTSFor("select * from t where uk = 1"), uint64(math.MaxUint64))
+
+	tk.MustExec("set @@tidb_enable_unique_key_point_get_max_ts = ON")
+	require.Equal(t, uint64(math.MaxUint64), readTSFor("select * from t where uk = 1"))
+	require.Equal(t, uint64(math.MaxUint64), readTSFor("select * from t where id = 1"))
+}

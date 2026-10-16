@@ -15,6 +15,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -27,6 +28,7 @@ import (
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/distsql"
 	"github.com/pingcap/tidb/pkg/executor/internal/exec"
+	executor_metrics "github.com/pingcap/tidb/pkg/executor/metrics"
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/infoschema"
 	"github.com/pingcap/tidb/pkg/kv"
@@ -46,6 +48,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/intest"
 	"github.com/pingcap/tidb/pkg/util/logutil/consistency"
 	"github.com/pingcap/tidb/pkg/util/rowcodec"
+	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikvrpc"
 	"github.com/tikv/client-go/v2/txnkv/txnsnapshot"
 )
@@ -102,6 +105,7 @@ func (b *executorBuilder) buildPointGet(p *physicalop.PointGetPlan) exec.Executo
 		b.err = err
 		return nil
 	}
+	e.readAtMaxTS = snapshotTS == math.MaxUint64
 	if p.TblInfo.TableCacheStatusType == model.TableCacheStatusEnable {
 		if cacheTable := b.getCacheTable(p.TblInfo, snapshotTS); cacheTable != nil {
 			e.snapshot = cacheTableSnapshot{e.snapshot, cacheTable}
@@ -133,6 +137,9 @@ type PointGetExecutor struct {
 	isStaleness      bool
 	txn              kv.Transaction
 	snapshot         kv.Snapshot
+	readAtMaxTS      bool
+	avgRowSize       float64
+	recheck          uniqueKeyRecheck
 	done             bool
 	lock             bool
 	lockWaitTime     int64
@@ -196,6 +203,8 @@ func (e *PointGetExecutor) Recreated(p *physicalop.PointGetPlan, ctx sessionctx.
 	e.snapshot.SetOption(kv.SnapshotTS, uint64(math.MaxUint64))
 	e.Init(p)
 	InitSnapshotWithSessCtx(e.snapshot, ctx, nil)
+	// A cached executor is only reused when the statement reads at MaxTS, see ExecStmt.PointGet.
+	e.readAtMaxTS = true
 }
 
 // Init set fields needed for PointGetExecutor reuse, this does NOT change baseExecutor field
@@ -222,9 +231,7 @@ func (e *PointGetExecutor) Init(p *physicalop.PointGetPlan) {
 	e.buildVirtualColumnInfo()
 
 	sessVars := e.Ctx().GetSessionVars()
-	if sessVars.IsReplicaReadClosestAdaptive() {
-		e.snapshot.SetOption(kv.ReplicaReadAdjuster, newReplicaReadAdjuster(e.Ctx(), p.GetAvgRowSize()))
-	}
+	e.avgRowSize = p.GetAvgRowSize()
 	failpoint.Inject("assertPointReplicaOption", func(val failpoint.Value) {
 		assertScope := val.(string)
 		if e.Ctx().GetSessionVars().GetReplicaRead().IsClosestRead() && assertScope != e.readReplicaScope {
@@ -233,14 +240,13 @@ func (e *PointGetExecutor) Init(p *physicalop.PointGetPlan) {
 	})
 
 	if e.RuntimeStats() != nil {
-		snapshotStats := &txnsnapshot.SnapshotRuntimeStats{}
 		e.stats = &runtimeStatsWithSnapshot{
-			SnapshotRuntimeStats: snapshotStats,
+			SnapshotRuntimeStats: &txnsnapshot.SnapshotRuntimeStats{},
 		}
-		e.snapshot.SetOption(kv.CollectRuntimeStats, snapshotStats)
 	} else {
 		e.stats = nil
 	}
+	e.setReadOptions(e.snapshot)
 
 	if p.IndexInfo != nil {
 		sctx := sessVars.StmtCtx
@@ -414,6 +420,15 @@ func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 	if err != nil {
 		return err
 	}
+	if e.readsUniqueIndexAtMaxTS() {
+		matched, err := e.rowMatchesIndexKey(tblID, val)
+		if err != nil {
+			return err
+		}
+		if !matched {
+			return e.nextWithFreshTS(ctx, req)
+		}
+	}
 	if len(val) == 0 {
 		if e.idxInfo != nil && !isCommonHandleRead(e.tblInfo, e.idxInfo) &&
 			!e.Ctx().GetSessionVars().StmtCtx.WeakConsistency {
@@ -456,6 +471,127 @@ func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 		return err
 	}
 	return nil
+}
+
+// readsUniqueIndexAtMaxTS reports whether this execution read a unique index entry and then the row it points to, both
+// at MaxTS. The two reads see the latest committed data at two different moments, so the row must be re-checked.
+func (e *PointGetExecutor) readsUniqueIndexAtMaxTS() bool {
+	return e.readAtMaxTS && !e.lock && e.idxInfo != nil && !isCommonHandleRead(e.tblInfo, e.idxInfo)
+}
+
+// uniqueKeyRecheck decodes only the unique index columns of a row. It is cached per table, index and session time
+// zone, because the row decoder converts time values to the session time zone.
+type uniqueKeyRecheck struct {
+	tblInfo *model.TableInfo
+	idxInfo *model.IndexInfo
+	loc     *time.Location
+	schema  *expression.Schema
+	types   []*types.FieldType
+	decoder *rowcodec.ChunkDecoder
+	chk     *chunk.Chunk
+}
+
+func (e *PointGetExecutor) uniqueKeyRecheckInfo() *uniqueKeyRecheck {
+	loc := e.Ctx().GetSessionVars().Location()
+	if e.recheck.tblInfo == e.tblInfo && e.recheck.idxInfo == e.idxInfo && e.recheck.loc == loc {
+		return &e.recheck
+	}
+	cols := make([]*expression.Column, 0, len(e.idxInfo.Columns))
+	fieldTypes := make([]*types.FieldType, 0, len(e.idxInfo.Columns))
+	for _, idxCol := range e.idxInfo.Columns {
+		colInfo := e.tblInfo.Columns[idxCol.Offset]
+		cols = append(cols, &expression.Column{ID: colInfo.ID, RetType: &colInfo.FieldType})
+		fieldTypes = append(fieldTypes, &colInfo.FieldType)
+	}
+	schema := expression.NewSchema(cols...)
+	e.recheck = uniqueKeyRecheck{
+		tblInfo: e.tblInfo,
+		idxInfo: e.idxInfo,
+		loc:     loc,
+		schema:  schema,
+		types:   fieldTypes,
+		decoder: NewRowDecoder(e.Ctx(), schema, e.tblInfo),
+		chk:     chunk.NewChunkWithCapacity(fieldTypes, 1),
+	}
+	return &e.recheck
+}
+
+// rowMatchesIndexKey reports whether the row still carries the unique key that was looked up. If it does, the row is
+// the correct answer as of the moment it was read, because a committed state keeps unique index and row in step.
+func (e *PointGetExecutor) rowMatchesIndexKey(tblID int64, val []byte) (bool, error) {
+	if len(val) == 0 {
+		return false, nil
+	}
+	recheck := e.uniqueKeyRecheckInfo()
+	recheck.chk.Reset()
+	if err := DecodeRowValToChunk(e.Ctx(), recheck.schema, e.tblInfo, e.handle, val, recheck.chk, recheck.decoder); err != nil {
+		return false, err
+	}
+	datums := recheck.chk.GetRow(0).GetDatumRow(recheck.types)
+	// A point lookup never matches NULL, and EncodeUniqueIndexKey would turn a NULL string into '' and accept it.
+	if slices.ContainsFunc(datums, func(d types.Datum) bool { return d.IsNull() }) {
+		return false, nil
+	}
+	key, err := physicalop.EncodeUniqueIndexKey(e.Ctx(), e.tblInfo, e.idxInfo, datums, tblID)
+	if kv.ErrNotExist.Equal(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(key, e.idxKey), nil
+}
+
+// nextWithFreshTS repeats the lookup on a snapshot at a newly fetched TSO, which is what a unique index point get does
+// when MaxTS reads are disabled.
+func (e *PointGetExecutor) nextWithFreshTS(ctx context.Context, req *chunk.Chunk) error {
+	failpoint.InjectCall("uniqueKeyPointGetMaxTSFallback")
+	executor_metrics.PointGetUniqueKeyMaxTSFallbackCounter.Inc()
+	snapshot, err := e.snapshotAtFreshTS(ctx)
+	if err != nil {
+		return err
+	}
+	maxTSSnapshot := e.snapshot
+	e.snapshot, e.readAtMaxTS, e.done = snapshot, false, false
+	defer func() {
+		e.snapshot, e.readAtMaxTS = maxTSSnapshot, true
+	}()
+	return e.Next(ctx, req)
+}
+
+func (e *PointGetExecutor) snapshotAtFreshTS(ctx context.Context) (kv.Snapshot, error) {
+	sctx := e.Ctx()
+	ts, err := sctx.GetStore().GetOracle().GetTimestamp(ctx, &oracle.Option{TxnScope: oracle.GlobalTxnScope})
+	if err != nil {
+		return nil, err
+	}
+	snapshot := sctx.GetStore().GetSnapshot(kv.NewVersion(ts))
+	sessVars := sctx.GetSessionVars()
+	snapshot.SetOption(kv.ReplicaRead, sessVars.GetReplicaRead())
+	if sessVars.InRestrictedSQL {
+		snapshot.SetOption(kv.RequestSourceInternal, true)
+	}
+	if tp := sessVars.RequestSourceType; tp != "" {
+		snapshot.SetOption(kv.RequestSourceType, tp)
+	}
+	if sessVars.LoadBasedReplicaReadThreshold > 0 {
+		snapshot.SetOption(kv.LoadBasedReplicaReadThreshold, sessVars.LoadBasedReplicaReadThreshold)
+	}
+	InitSnapshotWithSessCtx(snapshot, sctx, &e.readReplicaScope)
+	setOptionForTopSQL(sessVars.StmtCtx, snapshot)
+	e.setReadOptions(snapshot)
+	return snapshot, nil
+}
+
+// setReadOptions sets the per-executor read options on a snapshot. Init and the fresh-TSO fallback both use it, so
+// the fallback reads behave like the main ones.
+func (e *PointGetExecutor) setReadOptions(snapshot kv.Snapshot) {
+	if e.Ctx().GetSessionVars().IsReplicaReadClosestAdaptive() {
+		snapshot.SetOption(kv.ReplicaReadAdjuster, newReplicaReadAdjuster(e.Ctx(), e.avgRowSize))
+	}
+	if e.stats != nil {
+		snapshot.SetOption(kv.CollectRuntimeStats, e.stats.SnapshotRuntimeStats)
+	}
 }
 
 func shouldFillRowChecksum(schema *expression.Schema) (int, bool) {

@@ -1240,6 +1240,9 @@ type SessionVars struct {
 	// EnablePointGetCache is used to cache value for point get for read only scenario.
 	EnablePointGetCache bool
 
+	// EnableUniqueKeyPointGetMaxTS lets autocommit unique-index point gets read at MaxTS, see TiDBEnableUniqueKeyPointGetMaxTS.
+	EnableUniqueKeyPointGetMaxTS bool
+
 	// PlacementMode the placement mode we use
 	//   strict: Check placement settings strictly in ddl operations
 	//   ignore: Ignore all placement settings in ddl operations
@@ -2471,6 +2474,7 @@ func NewSessionVars(hctx HookContext) *SessionVars {
 		EnableParallelApply:              vardef.DefTiDBEnableParallelApply,
 		ShardAllocateStep:                vardef.DefTiDBShardAllocateStep,
 		EnablePointGetCache:              vardef.DefTiDBPointGetCache,
+		EnableUniqueKeyPointGetMaxTS:     vardef.DefTiDBEnableUniqueKeyPointGetMaxTS,
 		PartitionPruneMode:               *atomic2.NewString(vardef.DefTiDBPartitionPruneMode),
 		TxnScope:                         kv.NewDefaultTxnScopeVar(),
 		EnabledRateLimitAction:           vardef.DefTiDBEnableRateLimitAction,

@@ -2664,3 +2664,66 @@ func TestIssue52984(t *testing.T) {
 		tk.MustQuery("select p, o, v, sum(v) over w as 'sum' from t window w as (partition by p order by o rows between 0 preceding and 0 following) limit 10;")
 	}
 }
+
+func TestIsPointGetUniqueKeyMaxTSEligibility(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t_plain (id int primary key, uk int, v int, unique key uk_idx (uk))")
+	tk.MustExec("create table t_nonclustered (id int, v int, primary key (id) nonclustered)")
+	tk.MustExec("create table t_composite (id int primary key, a int, b int, unique key ab_idx (a, b))")
+	tk.MustExec("create table t_common (pk varchar(16), uk int, primary key (pk) clustered, unique key uk_idx (uk))")
+	tk.MustExec("create table t_gen (id int primary key, a int, g int as (a + 1) virtual, unique key g_idx (g))")
+	tk.MustExec("create table t_expr (id int primary key, a int, unique key e_idx ((a * 2)))")
+	tk.MustExec("create table t_part (id int, uk int, unique key uk_idx (uk)) partition by hash(uk) partitions 4")
+	tk.MustExec("create global temporary table t_tmp (id int primary key, uk int, unique key uk_idx (uk)) on commit delete rows")
+	ctx := tk.Session().(sessionctx.Context)
+
+	isMaxTSPointGet := func(sqlStr, wantIndex string) bool {
+		stmtNode, err := parser.New().ParseOneStmt(sqlStr, "", "")
+		require.NoError(t, err)
+		preprocessorReturn := &plannercore.PreprocessorReturn{}
+		nodeW := resolve.NewNodeW(stmtNode)
+		require.NoError(t, plannercore.Preprocess(context.Background(), ctx, nodeW, plannercore.WithPreprocessorReturn(preprocessorReturn)))
+		p, _, err := planner.Optimize(context.TODO(), ctx, nodeW, preprocessorReturn.InfoSchema)
+		require.NoError(t, err)
+		if wantIndex != "" {
+			plan := p
+			if proj, ok := plan.(*physicalop.PhysicalProjection); ok {
+				plan = proj.Children()[0]
+			}
+			pointGet, ok := plan.(*physicalop.PointGetPlan)
+			require.True(t, ok, "%s should plan as a PointGet", sqlStr)
+			require.NotNil(t, pointGet.IndexInfo, sqlStr)
+			require.Equal(t, wantIndex, pointGet.IndexInfo.Name.L, sqlStr)
+		}
+		return plannercore.IsPointGetWithPKOrUniqueKeyByAutoCommit(ctx.GetSessionVars(), p)
+	}
+
+	tk.MustExec("set @@tidb_enable_unique_key_point_get_max_ts = OFF")
+	require.False(t, isMaxTSPointGet("select * from t_plain where uk = 1", "uk_idx"))
+	require.True(t, isMaxTSPointGet("select * from t_plain where id = 1", ""))
+
+	tk.MustExec("set @@tidb_enable_unique_key_point_get_max_ts = ON")
+	cases := []struct {
+		sql       string
+		wantIndex string
+		want      bool
+	}{
+		{"select * from t_plain where uk = 1", "uk_idx", true},
+		{"select v from t_plain where uk = 1", "uk_idx", true},
+		{"select * from t_plain where uk = 1 for update", "uk_idx", true},
+		{"select * from t_plain where id = 1 for update", "", true},
+		{"select * from t_nonclustered where id = 1", "primary", true},
+		{"select * from t_composite where a = 1 and b = 2", "ab_idx", true},
+		{"select * from t_common where uk = 1", "uk_idx", true},
+		{"select * from t_gen where g = 2", "g_idx", false},
+		{"select * from t_expr where a * 2 = 4", "e_idx", false},
+		{"select * from t_part where uk = 1", "uk_idx", false},
+		{"select * from t_tmp where uk = 1", "uk_idx", false},
+		{"select * from t_plain where uk in (1, 2)", "", false},
+	}
+	for _, tc := range cases {
+		require.Equal(t, tc.want, isMaxTSPointGet(tc.sql, tc.wantIndex), tc.sql)
+	}
+}

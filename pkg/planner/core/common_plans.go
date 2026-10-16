@@ -1688,6 +1688,24 @@ func (e *Explain) prepareTaskDot(pa *pair, taskTp string, buffer *bytes.Buffer) 
 	}
 }
 
+// isMaxTSSafeUniqueIndexRead reports whether the PointGet executor can rebuild the unique index key from the row it
+// reads. An index read followed by a row read at MaxTS is only correct when the executor can confirm the row still
+// matches the index key and fall back to a TSO snapshot otherwise.
+func isMaxTSSafeUniqueIndexRead(p *physicalop.PointGetPlan) bool {
+	if p.Lock || p.TblInfo.Partition != nil || p.TblInfo.TempTableType != model.TempTableNone {
+		return false
+	}
+	if !p.IndexInfo.Unique || p.IndexInfo.Global {
+		return false
+	}
+	for _, idxCol := range p.IndexInfo.Columns {
+		if idxCol.Length != types.UnspecifiedLength || p.TblInfo.Columns[idxCol.Offset].IsGenerated() {
+			return false
+		}
+	}
+	return true
+}
+
 // IsPointGetWithPKOrUniqueKeyByAutoCommit returns true when meets following conditions:
 //  1. ctx is auto commit tagged
 //  2. session is not InTxn
@@ -1728,7 +1746,7 @@ func IsPointGetWithPKOrUniqueKeyByAutoCommit(vars *variable.SessionVars, p base.
 		// If the PointGetPlan needs to read data from Cache Table, we can't use max uint64,
 		// because math.MaxUint64 always make cacheData invalid.
 		noSecondRead := v.IndexInfo == nil || (v.IndexInfo.Primary && v.TblInfo.IsCommonHandle)
-		if !noSecondRead {
+		if !noSecondRead && !(vars.EnableUniqueKeyPointGetMaxTS && isMaxTSSafeUniqueIndexRead(v)) {
 			return false
 		}
 		if v.TblInfo != nil && (v.TblInfo.TableCacheStatusType != model.TableCacheStatusDisable) {

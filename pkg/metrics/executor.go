@@ -23,6 +23,10 @@ var (
 	// ExecutorCounter records the number of expensive executors.
 	ExecutorCounter *prometheus.CounterVec
 
+	// PointGetUniqueKeyMaxTSFallbackCounter counts unique index point gets read at MaxTS whose row no longer matched
+	// the index key, so the lookup was repeated at a fresh TSO.
+	PointGetUniqueKeyMaxTSFallbackCounter prometheus.Counter
+
 	// StmtNodeCounter records the number of statement with the same type.
 	StmtNodeCounter *prometheus.CounterVec
 
@@ -85,6 +89,15 @@ var (
 
 // InitExecutorMetrics initializes excutor metrics.
 func InitExecutorMetrics() {
+	PointGetUniqueKeyMaxTSFallbackCounter = metricscommon.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "tidb",
+			Subsystem: "executor",
+			Name:      "point_get_unique_key_max_ts_fallback_total",
+			Help:      "Counter of unique index point gets at MaxTS that fell back to a TSO snapshot.",
+		},
+	)
+
 	ExecutorCounter = metricscommon.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "tidb",

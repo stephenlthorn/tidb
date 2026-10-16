@@ -663,6 +663,11 @@ const (
 	// TiDBEnablePointGetCache is used to control whether to enable the point get cache for special scenario.
 	TiDBEnablePointGetCache = "tidb_enable_point_get_cache"
 
+	// TiDBEnableUniqueKeyPointGetMaxTS lets an autocommit point get through a unique secondary index read at MaxTS
+	// instead of fetching a TSO, re-checking that the row still matches the index key and falling back to a TSO
+	// snapshot when it does not.
+	TiDBEnableUniqueKeyPointGetMaxTS = "tidb_enable_unique_key_point_get_max_ts"
+
 	// TiDBPlacementMode is used to control the mode for placement
 	TiDBPlacementMode = "tidb_placement_mode"
 
@@ -1714,6 +1719,7 @@ const (
 	DefTiDBColumnarStorageEnabled           = true // missing rows keep historical SET TIFLASH REPLICA behavior
 	DefTiDBShardAllocateStep                = math.MaxInt64
 	DefTiDBPointGetCache                    = false
+	DefTiDBEnableUniqueKeyPointGetMaxTS     = false
 	DefTiDBEnableTelemetry                  = true
 	DefTiDBEnableParallelApply              = false
 	DefTiDBPartitionPruneMode               = "dynamic"

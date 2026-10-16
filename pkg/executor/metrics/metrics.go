@@ -57,6 +57,8 @@ var (
 
 	// FairLockingTxnUsedCount counts transactions where at least one statement has fair locking enabled.
 	FairLockingTxnUsedCount prometheus.Counter
+
+	PointGetUniqueKeyMaxTSFallbackCounter prometheus.Counter
 	// FairLockingStmtUsedCount counts statements that have fair locking enabled.
 	FairLockingStmtUsedCount prometheus.Counter
 	// FairLockingTxnEffectiveCount counts transactions where at least one statement has fair locking enabled,
@@ -158,6 +160,7 @@ func init() {
 // InitMetricsVars init executor metrics vars.
 func InitMetricsVars() {
 	TotalQueryProcHistogramGeneral = metrics.TotalQueryProcHistogram.WithLabelValues(metrics.LblGeneral)
+	PointGetUniqueKeyMaxTSFallbackCounter = metrics.PointGetUniqueKeyMaxTSFallbackCounter
 	TotalCopProcHistogramGeneral = metrics.TotalCopProcHistogram.WithLabelValues(metrics.LblGeneral)
 	TotalCopWaitHistogramGeneral = metrics.TotalCopWaitHistogram.WithLabelValues(metrics.LblGeneral)
 	CopMVCCRatioHistogramGeneral = metrics.CopMVCCRatioHistogram.WithLabelValues(metrics.LblGeneral)

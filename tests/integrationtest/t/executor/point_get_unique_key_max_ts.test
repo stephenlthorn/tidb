@@ -1,0 +1,25 @@
+# The variable is off by default and has GLOBAL and SESSION scope.
+select @@global.tidb_enable_unique_key_point_get_max_ts, @@session.tidb_enable_unique_key_point_get_max_ts;
+
+drop table if exists t;
+create table t (id int primary key, uk int, v int, unique key uk_idx (uk));
+insert into t values (1, 10, 100), (2, 20, 200), (3, NULL, 300);
+
+set @@session.tidb_enable_unique_key_point_get_max_ts = ON;
+explain format = 'brief' select v from t where uk = 10;
+select v from t where uk = 10;
+select v from t where uk = 30;
+select v from t where uk is null;
+update t set uk = 30 where id = 1;
+select v from t where uk = 10;
+select v from t where uk = 30;
+
+prepare st from 'select v from t where uk = ?';
+set @a = 20;
+execute st using @a;
+execute st using @a;
+set @a = 10;
+execute st using @a;
+
+set @@session.tidb_enable_unique_key_point_get_max_ts = default;
+select @@session.tidb_enable_unique_key_point_get_max_ts;

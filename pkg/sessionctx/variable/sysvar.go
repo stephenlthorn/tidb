@@ -971,6 +971,10 @@ var defaultSysVars = []*SysVar{
 		s.EnablePointGetCache = TiDBOptOn(val)
 		return nil
 	}},
+	{Scope: vardef.ScopeGlobal | vardef.ScopeSession, Name: vardef.TiDBEnableUniqueKeyPointGetMaxTS, Value: BoolToOnOff(vardef.DefTiDBEnableUniqueKeyPointGetMaxTS), Type: vardef.TypeBool, SetSession: func(s *SessionVars, val string) error {
+		s.EnableUniqueKeyPointGetMaxTS = TiDBOptOn(val)
+		return nil
+	}},
 	{Scope: vardef.ScopeGlobal | vardef.ScopeSession, Name: vardef.TiDBScatterRegion, Value: vardef.DefTiDBScatterRegion, PossibleValues: []string{vardef.ScatterOff, vardef.ScatterTable, vardef.ScatterGlobal}, Type: vardef.TypeStr,
 		SetSession: func(vars *SessionVars, val string) error {
 			vars.ScatterRegion = val

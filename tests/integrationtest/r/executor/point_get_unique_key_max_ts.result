@@ -1,0 +1,39 @@
+select @@global.tidb_enable_unique_key_point_get_max_ts, @@session.tidb_enable_unique_key_point_get_max_ts;
+@@global.tidb_enable_unique_key_point_get_max_ts	@@session.tidb_enable_unique_key_point_get_max_ts
+0	0
+drop table if exists t;
+create table t (id int primary key, uk int, v int, unique key uk_idx (uk));
+insert into t values (1, 10, 100), (2, 20, 200), (3, NULL, 300);
+set @@session.tidb_enable_unique_key_point_get_max_ts = ON;
+explain format = 'brief' select v from t where uk = 10;
+id	estRows	task	access object	operator info
+Point_Get	1.00	root	table:t, index:uk_idx(uk)	
+select v from t where uk = 10;
+v
+100
+select v from t where uk = 30;
+v
+select v from t where uk is null;
+v
+300
+update t set uk = 30 where id = 1;
+select v from t where uk = 10;
+v
+select v from t where uk = 30;
+v
+100
+prepare st from 'select v from t where uk = ?';
+set @a = 20;
+execute st using @a;
+v
+200
+execute st using @a;
+v
+200
+set @a = 10;
+execute st using @a;
+v
+set @@session.tidb_enable_unique_key_point_get_max_ts = default;
+select @@session.tidb_enable_unique_key_point_get_max_ts;
+@@session.tidb_enable_unique_key_point_get_max_ts
+0

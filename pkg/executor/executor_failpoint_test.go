@@ -41,6 +41,7 @@ import (
 	"github.com/pingcap/tidb/pkg/store/copr"
 	"github.com/pingcap/tidb/pkg/store/helper"
 	"github.com/pingcap/tidb/pkg/testkit"
+	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
 	"github.com/pingcap/tidb/pkg/util/deadlockhistory"
@@ -1235,4 +1236,160 @@ func TestIndexLookUpPushDownPartitionExec(t *testing.T) {
 			v.RunSelectWithCheck("1", 0, -1)
 		}
 	}
+}
+
+func TestUniqueKeyPointGetAtMaxTSRechecksRow(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	reader := testkit.NewTestKit(t, store)
+	reader.MustExec("use test")
+	reader.MustExec("set @@tidb_enable_unique_key_point_get_max_ts = ON")
+	writer := testkit.NewTestKit(t, store)
+	writer.MustExec("use test")
+
+	const (
+		step1 = "github.com/pingcap/tidb/pkg/executor/pointGetRepeatableReadTest-step1"
+		step2 = "github.com/pingcap/tidb/pkg/executor/pointGetRepeatableReadTest-step2"
+	)
+	var fallbacks atomic.Int32
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/executor/uniqueKeyPointGetMaxTSFallback", func() {
+		fallbacks.Add(1)
+	})
+
+	queryWithWriteBetweenIndexAndRowRead := func(t *testing.T, query string, writes ...string) [][]any {
+		require.NoError(t, failpoint.Enable(step1, "return"))
+		require.NoError(t, failpoint.Enable(step2, "pause"))
+		t.Cleanup(func() {
+			_ = failpoint.Disable(step1)
+			_ = failpoint.Disable(step2)
+		})
+		indexRead := make(chan struct{})
+		type outcome struct {
+			rows [][]any
+			err  error
+		}
+		done := make(chan outcome, 1)
+		go func() {
+			ctx := context.WithValue(context.Background(), "pointGetRepeatableReadTest", indexRead)
+			ctx = failpoint.WithHook(ctx, func(_ context.Context, fpname string) bool {
+				return fpname == step1 || fpname == step2
+			})
+			rs, err := reader.Session().Execute(ctx, query)
+			if err != nil {
+				done <- outcome{err: err}
+				return
+			}
+			done <- outcome{rows: reader.ResultSetToResultWithCtx(ctx, rs[0], query).Rows()}
+		}()
+		select {
+		case <-indexRead:
+		case got := <-done:
+			t.Fatalf("the lookup finished before reaching the index read failpoint: %v", got.err)
+		case <-time.After(30 * time.Second):
+			t.Fatal("the lookup never reached the index read failpoint")
+		}
+		require.NoError(t, failpoint.Disable(step1))
+		for _, w := range writes {
+			writer.MustExec(w)
+		}
+		require.NoError(t, failpoint.Disable(step2))
+		got := <-done
+		require.NoError(t, got.err)
+		return got.rows
+	}
+
+	cases := []struct {
+		name         string
+		create       string
+		rows         string
+		query        string
+		writes       []string
+		want         [][]any
+		wantFallback bool
+	}{
+		{
+			name:         "unique key moved away from the row",
+			rows:         "(1, 1, 1)",
+			query:        "select c from point_get where b = 1",
+			writes:       []string{"update point_get set b = 2, c = 2 where a = 1"},
+			want:         testkit.Rows(),
+			wantFallback: true,
+		},
+		{
+			name:   "non-key column changed",
+			rows:   "(1, 1, 1)",
+			query:  "select c from point_get where b = 1",
+			writes: []string{"update point_get set c = 2 where a = 1"},
+			want:   testkit.Rows("2"),
+		},
+		{
+			name:         "row deleted",
+			rows:         "(1, 1, 1)",
+			query:        "select c from point_get where b = 1",
+			writes:       []string{"delete from point_get where a = 1"},
+			want:         testkit.Rows(),
+			wantFallback: true,
+		},
+		{
+			name:  "unique key moved to another row",
+			rows:  "(1, 1, 1), (2, 2, 2)",
+			query: "select a, c from point_get where b = 1",
+			writes: []string{
+				"begin",
+				"update point_get set b = 3 where a = 1",
+				"update point_get set b = 1 where a = 2",
+				"commit",
+			},
+			want:         testkit.Rows("2 2"),
+			wantFallback: true,
+		},
+		{
+			name:         "unique key set to NULL",
+			create:       "create table point_get (a int, b varchar(8), c int, primary key k_a(a), unique key k_b(b))",
+			rows:         "(1, '', 1)",
+			query:        "select c from point_get where b = ''",
+			writes:       []string{"update point_get set b = NULL, c = 2 where a = 1"},
+			want:         testkit.Rows(),
+			wantFallback: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader.MustExec("drop table if exists point_get")
+			create := tc.create
+			if create == "" {
+				create = "create table point_get (a int, b int, c int, primary key k_a(a), unique key k_b(b))"
+			}
+			reader.MustExec(create)
+			reader.MustExec("insert into point_get values " + tc.rows)
+			fallbacks.Store(0)
+			require.Equal(t, tc.want, queryWithWriteBetweenIndexAndRowRead(t, tc.query, tc.writes...))
+			wantFallbacks := int32(0)
+			if tc.wantFallback {
+				wantFallbacks = 1
+			}
+			require.Equal(t, wantFallbacks, fallbacks.Load())
+		})
+	}
+}
+
+func TestUniqueKeyPointGetAtMaxTSMatchesUnderCollation(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_enable_unique_key_point_get_max_ts = ON")
+	tk.MustExec("create table t (id int primary key, s varchar(32) collate utf8mb4_general_ci, d int, unique key s_idx (s))")
+	tk.MustExec("insert into t values (1, 'abc', 10), (2, 'xyz', 20)")
+	var fallbacks atomic.Int32
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/executor/uniqueKeyPointGetMaxTSFallback", func() {
+		fallbacks.Add(1)
+	})
+
+	tk.MustQuery("select id, d from t where s = 'ABC'").Check(testkit.Rows("1 10"))
+	tk.MustQuery("select json_extract(@@tidb_last_txn_info, '$.start_ts')").Check(testkit.Rows("18446744073709551615"))
+	tk.MustQuery("select id, d from t where s = 'nope'").Check(testkit.Rows())
+	tk.MustExec("prepare st from 'select id, d from t where s = ?'")
+	tk.MustExec("set @v = 'XYZ'")
+	tk.MustQuery("execute st using @v").Check(testkit.Rows("2 20"))
+	tk.MustQuery("execute st using @v").Check(testkit.Rows("2 20"))
+	require.Zero(t, fallbacks.Load())
 }

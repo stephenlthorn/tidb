@@ -492,8 +492,9 @@ func (a *ExecStmt) PointGet(ctx context.Context) (*recordSet, error) {
 		}
 		pointExecutor, ok := executor.(*PointGetExecutor)
 
-		// Don't cache the executor for non point-get (table dual) or partitioned tables
-		if ok && useMaxTS && pointExecutor.partitionDefIdx == nil {
+		// Don't cache the executor for non point-get (table dual) or partitioned tables. A unique index read at MaxTS
+		// is not cached either: a cached executor skips the privilege and table lock checks of later executions.
+		if ok && useMaxTS && pointExecutor.partitionDefIdx == nil && !pointExecutor.readsUniqueIndexAtMaxTS() {
 			a.PsStmt.PointGet.Executor = pointExecutor
 		}
 	}
