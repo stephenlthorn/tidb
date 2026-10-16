@@ -17,6 +17,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -189,6 +190,10 @@ func (e *PointGetExecutor) Recreated(p *physicalop.PointGetPlan, ctx sessionctx.
 	e.BaseExecutor = exec.NewBaseExecutor(ctx, p.Schema(), p.ID())
 	e.indexUsageReporter = buildIndexUsageReporter(ctx, p, false)
 
+	// The snapshot remembers which locks it may skip. That is only valid for the statement that resolved them: a
+	// transaction that was still running then may have committed since, and skipping its leftover secondary lock would
+	// return a value older than an acknowledged write. Resetting the read ts clears those hints and the value cache.
+	e.snapshot.SetOption(kv.SnapshotTS, uint64(math.MaxUint64))
 	e.Init(p)
 	InitSnapshotWithSessCtx(e.snapshot, ctx, nil)
 }

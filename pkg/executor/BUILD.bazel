@@ -399,6 +399,7 @@ go_test(
         "parallel_apply_test.go",
         "partition_table_test.go",
         "pkg_test.go",
+        "point_get_lock_hint_test.go",
         "point_get_test.go",
         "prepared_test.go",
         "resource_tag_test.go",
